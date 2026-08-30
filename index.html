@@ -432,10 +432,18 @@ function fitTitle(){
 function fit(){
   const pad = 8;
   const board = $('#board');
+  const vw = window.innerWidth, vh = window.innerHeight;
+
+  /* OBS reports a 0x0 window while a source is being created or a scene
+     reactivates. Scaling against that yields a negative --s and the board
+     disappears until the next refresh, so sit tight and keep the last size. */
+  if (vw < 40 || vh < 40) return;
+
   fitTitle();
-  const w = (window.innerWidth  - pad) / DESIGN_W;
-  const h = (window.innerHeight - pad) / Math.max(board.offsetHeight, 1);
-  document.documentElement.style.setProperty('--s', Math.min(w, h, 2).toFixed(4));
+  const w = (vw - pad) / DESIGN_W;
+  const h = (vh - pad) / Math.max(board.offsetHeight, 1);
+  document.documentElement.style.setProperty(
+    '--s', Math.max(0.05, Math.min(w, h, 2)).toFixed(4));
 }
 window.addEventListener('resize', fit);
 
