@@ -368,7 +368,35 @@ function iconHTML(t, cls){
     : '<div class="' + cls + '"></div>';
 }
 
-const SCHEDULE = [
+/* Which discipline column a Game cell belongs to, and what the two sides are
+   called. Both are derived from the Game name, so adding a row for a title
+   needs no code change. */
+function gameKeyFor(label){
+  const g = String(label).toLowerCase();
+  if (g.includes('valorant'))                    return 'val';
+  if (g.includes('tft') || g.includes('teamfight')) return 'tft';
+  if (g.includes('league') || g.includes('lol')) return 'lol';
+  return 'other';
+}
+function sidesFor(gk){
+  if (gk === 'val') return ['ATK', 'DEF'];
+  if (gk === 'lol') return ['BLUE', 'RED'];
+  return [null, null];          // TFT lobbies have no sides
+}
+
+/* Accepts '13:00' or '1:00 PM'; returns minutes past midnight, or null. */
+function clockMins(raw){
+  const m = String(raw).match(/(\d{1,2}):(\d{2})\s*([AaPp])?/);
+  if (!m) return null;
+  let h = +m[1];
+  const min = +m[2], mer = m[3] && m[3].toLowerCase();
+  if (mer === 'p' && h < 12) h += 12;
+  if (mer === 'a' && h === 12) h = 0;
+  return h * 60 + min;
+}
+
+/* Used only when the Schedule tab can't be read at all. */
+const FALLBACK_SCHEDULE = [
   { slot:1, game:'Valorant', gk:'val', start:'13:00', end:'14:00', matches:[
       { a:'Hide on Smoke', b:'sALt',          as:'ATK', bs:'DEF' },
       { a:'Cooked',        b:'Flip 4 It',     as:'ATK', bs:'DEF' } ] },
@@ -396,7 +424,10 @@ const SCHEDULE = [
   { slot:9, game:'League',   gk:'lol', start:'21:30', end:'22:30', matches:[
       { a:'Hide on Smoke', b:'sALt',          as:'BLUE', bs:'RED' },
       { a:'Flip 4 It',     b:'Cooked',        as:'BLUE', bs:'RED' } ] }
-];
+].map(s => ({
+  slot:s.slot, game:s.game, gk:s.gk, time:fmtTime(s.start),
+  start:clockMins(s.start), end:clockMins(s.end), matches:s.matches
+}));
 
 const DESIGN_W = 1240;
 const $ = s => document.querySelector(s);
@@ -487,23 +518,26 @@ function cellOf(r, i){
 }
 
 /* ---------- standings, derived entirely from the match winners ---------- */
-function computeStandings(results){
+function computeStandings(state){
   const acc = {};
   for (const k of Object.keys(TEAMS)){
-    acc[k] = { val:{w:0,l:0}, tft:{w:0,l:0}, lol:{w:0,l:0} };
+    /* w/l track the overall record so a title we don't have a column for
+       still counts toward the total */
+    acc[k] = { val:{w:0,l:0}, tft:{w:0,l:0}, lol:{w:0,l:0}, w:0, l:0 };
   }
 
   /* every decided match is one win for someone and one loss for the other */
   const h2h = {};                       // 'winner|loser' -> how many times
-  SCHEDULE.forEach(s => s.matches.forEach((m, j) => {
-    const won = results && results[s.slot + '|' + 'AB'[j]];
+  state.slots.forEach(s => s.matches.forEach(m => {
+    const won = state.results[s.slot + '|' + m.letter];
     if (!won) return;
     const a = key(m.a), b = key(m.b);
     if (won !== a && won !== b) return; // a name that matches neither side
     const lost = won === a ? b : a;
     if (!acc[won] || !acc[lost]) return;
-    acc[won][s.gk].w++;
-    acc[lost][s.gk].l++;
+    if (acc[won][s.gk]){ acc[won][s.gk].w++; acc[lost][s.gk].l++; }
+    acc[won].w++;
+    acc[lost].l++;
     h2h[won + '|' + lost] = (h2h[won + '|' + lost] || 0) + 1;
   }));
 
@@ -511,9 +545,7 @@ function computeStandings(results){
     const t = TEAMS[k], a = acc[k];
     return {
       key:k, name:t.name, icon:t.icon, keepCase:!!t.keepCase,
-      val:a.val, tft:a.tft, lol:a.lol,
-      w: a.val.w + a.tft.w + a.lol.w,
-      l: a.val.l + a.tft.l + a.lol.l
+      val:a.val, tft:a.tft, lol:a.lol, w:a.w, l:a.l
     };
   });
 
@@ -528,27 +560,66 @@ function computeStandings(results){
   return teams;
 }
 
-/* ---------- optional schedule tab: Slot | Match | Winner ---------- */
-function parseResults(res){
+/* ---------- the Schedule tab IS the schedule ----------
+   Slot | Match | Time | Game | Team 1 | Team 2 | Winner
+   Everything on screen comes from here: pairings, times, order and results. */
+function parseSchedule(res){
   const find = indexer(res);
 
   /* a CSV pasted into a single cell still "matches" every header we look for,
      which would silently parse to nonsense — catch that before it does */
   if (res.table.cols.length < 3) throw new Error('not split into columns');
 
-  const iSlot = find('slot'), iMatch = find('match'), iWin = find('winner', 'result', 'won');
+  const iSlot = find('slot'), iMatch = find('match'), iTime = find('time');
+  const iGame = find('game', 'title'), iWin = find('winner', 'result', 'won');
+  const iA = find('team 1', 'team1', 'home'), iB = find('team 2', 'team2', 'away');
+
   if (iSlot < 0 || iWin < 0) throw new Error('needs Slot and Winner columns');
   if (iSlot === iWin)        throw new Error('not split into columns');
+  if (iA < 0 || iB < 0)      throw new Error('needs Team 1 and Team 2 columns');
 
-  const out = {};
+  const slots = [], bySlot = {}, results = {};
+
   res.table.rows.forEach(r => {
     const slot = parseInt(cellOf(r, iSlot), 10);
-    if (!slot) return;
-    const m = (cellOf(r, iMatch) || '').toUpperCase().replace(/[^AB]/g, '') || 'A';
+    const a = cellOf(r, iA), b = cellOf(r, iB);
+    if (!slot || (!a && !b)) return;
+
+    const game = cellOf(r, iGame) || '';
+    const gk   = gameKeyFor(game);
+
+    if (!bySlot[slot]){
+      const t = cellOf(r, iTime);
+      bySlot[slot] = {
+        slot, game, gk,
+        time: t, start: clockMins(t), end: null,
+        matches: []
+      };
+      slots.push(bySlot[slot]);   // sheet row order decides slot order
+    }
+
+    const sides = sidesFor(gk);
+    /* takes the trailing letter, so 'A' and 'Match A' both read as A;
+       blank falls back to this row's position within the slot */
+    const tag = (cellOf(r, iMatch) || '').toUpperCase().match(/([A-Z])\s*$/);
+    const letter = tag ? tag[1] : ('AB'[bySlot[slot].matches.length] || 'A');
+
+    bySlot[slot].matches.push({ a, b, as:sides[0], bs:sides[1], letter });
+
     const w = cellOf(r, iWin);
-    if (w) out[slot + '|' + m] = key(w);
+    if (w) results[slot + '|' + letter] = key(w);
   });
-  return out;
+
+  if (!slots.length) throw new Error('no match rows found');
+
+  /* a slot runs until the next one starts; the last gets an hour */
+  slots.forEach((s, i) => {
+    const next = slots[i + 1];
+    s.end = (next && next.start != null) ? next.start
+          : (s.start != null ? s.start + 60 : null);
+  });
+
+  return { slots, results };
 }
 
 /* ---------- which slot is live ---------- */
@@ -557,30 +628,34 @@ function ptMinutes(){
   const [h, m] = s.split(':').map(Number);
   return h * 60 + m;
 }
-const mins = hhmm => { const [h, m] = hhmm.split(':').map(Number); return h * 60 + m; };
+function currentIndex(state){
+  const slots = state.slots;
+  if (CONFIG.slot) return Math.min(Math.max(CONFIG.slot, 1), slots.length) - 1;
 
-function currentIndex(results){
-  if (CONFIG.slot) return Math.min(Math.max(CONFIG.slot, 1), SCHEDULE.length) - 1;
-
-  /* prefer the sheet: the first slot whose two matches aren't both decided */
-  if (results){
-    for (let i = 0; i < SCHEDULE.length; i++){
-      const done = SCHEDULE[i].matches.every((_, j) => results[SCHEDULE[i].slot + '|' + 'AB'[j]]);
+  /* the first slot whose matches aren't all decided */
+  const anyResult = Object.keys(state.results).length > 0;
+  if (anyResult){
+    for (let i = 0; i < slots.length; i++){
+      const done = slots[i].matches.every(m => state.results[slots[i].slot + '|' + m.letter]);
       if (!done) return i;
     }
-    return SCHEDULE.length;   /* everything played */
+    return slots.length;   /* everything played */
   }
 
-  /* otherwise fall back to the clock */
+  /* nothing played yet — fall back to the clock */
   const now = ptMinutes();
-  for (let i = 0; i < SCHEDULE.length; i++) if (now < mins(SCHEDULE[i].end)) return i;
-  return SCHEDULE.length;
+  for (let i = 0; i < slots.length; i++){
+    if (slots[i].end != null && now < slots[i].end) return i;
+  }
+  return 0;
 }
-function isLive(i){
-  if (i < 0 || i >= SCHEDULE.length) return false;
+function isLive(state, i){
+  const s = state.slots[i];
+  if (!s) return false;
   if (CONFIG.slot) return true;
+  if (s.start == null || s.end == null) return false;
   const now = ptMinutes();
-  return now >= mins(SCHEDULE[i].start) && now < mins(SCHEDULE[i].end);
+  return now >= s.start && now < s.end;
 }
 
 /* ---------- draw: standings ---------- */
@@ -640,14 +715,8 @@ function fmtTime(hhmm){
   return h + ':' + String(m).padStart(2, '0') + ' ' + ap;
 }
 
-const DISCIPLINES = [
-  { gk:'val', label:'Valorant' },
-  { gk:'tft', label:'TFT'      },
-  { gk:'lol', label:'League'   }
-];
-
-function matchCardHTML(s, m, j, results, isUp, live){
-  const winner = results ? results[s.slot + '|' + 'AB'[j]] : null;
+function matchCardHTML(s, m, results, isUp, live){
+  const winner = results[s.slot + '|' + m.letter] || null;
 
   /* one team's line: icon, name, then either its side tag or the result */
   function line(rawName, side){
@@ -666,8 +735,8 @@ function matchCardHTML(s, m, j, results, isUp, live){
 
   return '<div class="mcard' + (isUp ? ' up' : '') + '">' +
     '<div class="mtop">' +
-      '<span class="mslot">Slot ' + s.slot + ' · ' + 'AB'[j] + '</span>' +
-      '<span>' + fmtTime(s.start) + '</span>' +
+      '<span class="mslot">Slot ' + esc(s.slot) + ' · ' + esc(m.letter) + '</span>' +
+      '<span>' + esc(s.time || '') + '</span>' +
       '<span class="sp"></span>' +
       (isUp
         ? '<span class="mflag">' + (live ? '<span class="dot"></span>Live' : 'Up next') + '</span>'
@@ -678,17 +747,26 @@ function matchCardHTML(s, m, j, results, isUp, live){
   '</div>';
 }
 
-function renderSchedule(results){
-  const cur    = currentIndex(results);
-  const live   = isLive(cur);
-  const upSlot = SCHEDULE[cur] ? SCHEDULE[cur].slot : null;
+function renderSchedule(state){
+  const cur    = currentIndex(state);
+  const live   = isLive(state, cur);
+  const upSlot = state.slots[cur] ? state.slots[cur].slot : null;
 
-  $('#schedule').innerHTML = DISCIPLINES.map(d =>
+  /* one column per game title, in the order the titles first appear */
+  const cols = [];
+  state.slots.forEach(s => {
+    let c = cols.find(x => x.gk === s.gk && x.label === s.game);
+    if (!c) cols.push(c = { gk:s.gk, label:s.game, slots:[] });
+    c.slots.push(s);
+  });
+
+  $('#schedule').style.gridTemplateColumns = 'repeat(' + Math.max(cols.length, 1) + ', 1fr)';
+  $('#schedule').innerHTML = cols.map(c =>
     '<div class="gcol">' +
-      '<div class="ghead ' + d.gk + '">' + esc(d.label) + '</div>' +
-      SCHEDULE.filter(s => s.gk === d.gk).map(s =>
-        s.matches.map((m, j) =>
-          matchCardHTML(s, m, j, results, s.slot === upSlot, live)
+      '<div class="ghead ' + c.gk + '">' + esc(c.label) + '</div>' +
+      c.slots.map(s =>
+        s.matches.map(m =>
+          matchCardHTML(s, m, state.results, s.slot === upSlot, live)
         ).join('')
       ).join('') +
     '</div>'
@@ -696,23 +774,24 @@ function renderSchedule(results){
 }
 
 /* ---------- refresh cycle ---------- */
-/* the Schedule tab is the only input: standings are computed from its winners */
-let results = null;   // last good set of results
+/* the Schedule tab is the only input: pairings, times, order AND results */
+let state = { slots: FALLBACK_SCHEDULE, results: {} };
+let haveSheet = false;
 
 async function load(){
   let fresh = null, err = null;
-  try { fresh = parseResults(await gviz(CONFIG.schedule)); }
+  try { fresh = parseSchedule(await gviz(CONFIG.schedule)); }
   catch (e) { err = e.message; console.info('Schedule tab unreadable:', e.message); }
 
-  /* on a blip keep the last good results on screen rather than blanking */
-  if (fresh) results = fresh;
+  /* on a blip keep the last good data on screen rather than blanking */
+  if (fresh){ state = fresh; haveSheet = true; }
 
-  renderStandings(computeStandings(results));
-  renderSchedule(results);
+  renderStandings(computeStandings(state));
+  renderSchedule(state);
 
   if (!err) setStatus('Live', false);
-  else setStatus(results ? 'Reconnecting — showing last good data'
-                         : 'Cannot read Schedule tab: ' + err, true);
+  else setStatus(haveSheet ? 'Reconnecting — showing last good data'
+                           : 'Cannot read Schedule tab: ' + err, true);
 
   $('#updated').textContent = 'Updated ' +
     new Date().toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
@@ -731,7 +810,7 @@ function esc(s){
 }
 
 /* ---------- go ---------- */
-renderSchedule(null);
+renderSchedule(state);
 load();
 setInterval(load, CONFIG.poll);
 fit();
